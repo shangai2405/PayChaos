@@ -67,7 +67,7 @@ stripe listen --forward-to 127.0.0.1:8081/webhooks
 paychaos -webhook-listen 127.0.0.1:8081 -webhook-target http://127.0.0.1:3000/stripe/webhook
 ```
 
-The relay acknowledges each event immediately, then delivers it to your app with injected duplicates, random delays and shuffled order. The `Stripe-Signature` header is forwarded unchanged, so duplicates carry a valid signature, exactly like Stripe's own redeliveries.
+The relay acknowledges each event immediately, then delivers it to your app with injected duplicates, random delays and shuffled order. The `Stripe-Signature` header is forwarded unchanged, so duplicates carry a valid signature, exactly like Stripe's own redeliveries. `examples/scenarios/webhook-storm.json` turns webhook chaos up (most events delivered three times, wide reordering) and injects no API faults, for testing handlers on their own.
 
 ## Safety
 
@@ -83,12 +83,13 @@ The relay acknowledges each event immediately, then delivers it to your app with
 | `drop_after_commit` | Forwarded and processed, then the client connection is reset (TCP RST) before the response arrives | Yes |
 | `error_500_after_commit` | Forwarded and processed, then the client is told `500` | Yes |
 | `hold_response` | Forwarded and processed; the response is held for `delay_ms`, so a client with a shorter timeout gives up | Yes |
+| `truncate_after_commit` | Forwarded and processed; the client gets the real status and headers but only half the body, then a TCP reset | Yes |
 | `timeout_before_forward` | Proxy stalls, then answers 504 | No |
 | `rate_limit_429` | Stripe-shaped `rate_limit` error | No |
 | `error_500` | Stripe-shaped `api_error` | No |
 | `latency` | Delay, then forwarded normally | Yes |
 
-Rules are evaluated in file order; the first matching rule that fires wins. A rule can set `"should_retry": "true"` or `"false"` to send Stripe's `Stripe-Should-Retry` header on its injected errors; official SDKs obey it. It is opt-in rather than automatic because the right value depends on the scenario: stripe-go's source notes that Stripe usually sends `false` on 500s. Print the default scenario with `paychaos scenario`.
+Rules are evaluated in file order; the first matching rule that fires wins. A rule can set `"should_retry": "true"` or `"false"` to send Stripe's `Stripe-Should-Retry` header on its injected errors; official SDKs obey it. It is opt-in rather than automatic because the right value depends on the scenario: stripe-go's source notes that Stripe usually sends `false` on 500s. Print the default scenario with `paychaos scenario`, and check your own files with `paychaos validate my-scenario.json` (it lists the known faults when one is wrong).
 
 ## What the auditor flags
 
@@ -103,6 +104,7 @@ Only POSTs to money-moving endpoints (`/v1/payment_intents`, `/v1/charges`, `/v1
 | `IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_BODY` | MEDIUM | One key used for two different requests; Stripe rejects this. |
 | `MISSING_IDEMPOTENCY_KEY` | MEDIUM | A money-moving POST without a key. |
 | `RETRY_WITHOUT_BACKOFF` | LOW | Retried a 429/5xx faster than `min_backoff_ms`. |
+| `TRUNCATED_SUCCESS_NOT_RETRIED` | LOW | A request committed and the client got a 2xx, but the body was cut short and it never retried. Whether that is a bug depends on whether the client reads the created object from the body. |
 
 ### Grouping retries by operation
 
@@ -115,6 +117,25 @@ By default two requests are "the same operation" when they share account, method
 Requests carrying it are grouped by its value instead. Stripe recommends putting a local identifier in metadata for reconciliation, so most integrations already send one. The rotating-key demo client produces 5 duplicates that are only caught this way.
 
 The process exits with status `2` when any HIGH finding exists, so it can gate a CI job (`-fail-on-high=false` to disable). A live JSON report is served at `GET /__paychaos/report`.
+
+## CI integration
+
+Besides the JSON report, a run can write two more formats on exit:
+
+```bash
+paychaos -config paychaos.json -junit paychaos-junit.xml -markdown "$GITHUB_STEP_SUMMARY"
+```
+
+- `-junit FILE` writes one failing test case per finding, so CI test reporters (GitHub, GitLab, Jenkins, CircleCI) show findings next to ordinary test results. A clean run writes one passing case.
+- `-markdown FILE` appends a summary table, suited to `$GITHUB_STEP_SUMMARY` or a PR comment. Use `-` for stdout.
+
+Existing integrations rarely start with zero findings. `paychaos compare` lets a pipeline fail only on findings a change introduces:
+
+```bash
+paychaos compare -fail-on medium baseline.json current.json
+```
+
+Findings are grouped by code, severity and path, and counted, because request numbers and object ids differ between runs. It prints what got worse (`+`) and better (`-`) and exits `2` when a new finding is at least as severe as `-fail-on` (default `high`). Add `-json` for machine-readable output. Both runs should use the same seed, scenario and workload, otherwise different faults fire; `compare` warns when the seeds differ. `examples/ci/github-actions.yml` is a complete workflow that builds a baseline on the base branch and compares the pull request against it.
 
 ## Stripe behaviour that is modelled
 
@@ -130,6 +151,7 @@ From Stripe's [idempotent requests](https://docs.stripe.com/api/idempotent_reque
 
 These are the parts that are easy to get subtly wrong.
 
+- **Truncation keeps the real status.** `truncate_after_commit` writes the upstream's own status line and a `Content-Length` for the full body, then sends half of it and resets. The client holds a genuine 200; only parsing fails. Because the client may have accepted that 200, not retrying it is LOW rather than the MEDIUM used when the client was told the request failed.
 - **A real TCP reset, not an error response.** `drop_after_commit` hijacks the client connection and closes it with `SO_LINGER` set to 0. A normal close sends FIN after flushing; linger 0 discards buffered data and sends RST, so the client sees "connection reset by peer", which is what a dropped load-balancer connection looks like. Returning a 502 instead would tell the client the request failed, which is a different and easier case.
 - **The upstream call outlives the client.** For faults that cut the client off, the upstream request uses `context.WithoutCancel`, so cutting the client doesn't cancel the charge mid-flight. Otherwise the fault would test nothing.
 - **Record before reset.** The proxy records the committed attempt before resetting the connection. The client's retry can only start after the reset, so it is guaranteed to see the earlier attempt; recording afterwards would be a race the retry could win.
@@ -157,8 +179,8 @@ internal/proxy/          reverse proxy, key safety checks, faults, connection re
 internal/audit/          fingerprinting, operation grouping, retry-safety findings
 internal/webhook/        duplicating / delaying / reordering relay
 internal/mock/           small Stripe-shaped API with idempotency semantics
-internal/report/         JSON and terminal reports
-examples/                naive, rotating-key and safe clients; stripe-go client; scenarios
+internal/report/         JSON, terminal, JUnit and Markdown reports; baseline comparison
+examples/                naive, rotating-key and safe clients; stripe-go client; scenarios; CI workflow
 scripts/                 demos and the GIF renderer
 ```
 
