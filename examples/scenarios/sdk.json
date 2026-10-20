@@ -1,0 +1,21 @@
+{
+  "seed": 11,
+  "rules": [
+    {
+      "name": "lost-response",
+      "match": { "method": "POST", "path_prefix": "/v1/payment_intents" },
+      "fault": "drop_after_commit",
+      "probability": 0.25
+    },
+    {
+      "name": "committed-500-do-not-retry",
+      "match": { "method": "POST", "path_prefix": "/v1/payment_intents" },
+      "fault": "error_500_after_commit",
+      "probability": 0.2,
+      "should_retry": "false"
+    }
+  ],
+  "webhooks": { "duplicate_probability": 0, "duplicate_count": 0, "max_delay_ms": 0, "reorder_window_ms": 0 },
+  "operation_id": ["metadata[order_id]"],
+  "min_backoff_ms": 200
+}

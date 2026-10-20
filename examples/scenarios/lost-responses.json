@@ -1,0 +1,32 @@
+{
+  "seed": 7,
+  "rules": [
+    {
+      "name": "lost-response-on-payment",
+      "match": {
+        "method": "POST",
+        "path_prefix": "/v1/payment_intents"
+      },
+      "fault": "drop_after_commit",
+      "probability": 0.3
+    },
+    {
+      "name": "rate-limited",
+      "match": {
+        "method": "POST"
+      },
+      "fault": "rate_limit_429",
+      "probability": 0.1
+    }
+  ],
+  "webhooks": {
+    "duplicate_probability": 0.5,
+    "duplicate_count": 1,
+    "max_delay_ms": 200,
+    "reorder_window_ms": 1000
+  },
+  "min_backoff_ms": 200,
+  "operation_id": [
+    "metadata[order_id]"
+  ]
+}
