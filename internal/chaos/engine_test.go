@@ -92,3 +92,21 @@ func TestStreamsAreIndependent(t *testing.T) {
 		}
 	}
 }
+
+func TestKnownFaultsSortedAndValid(t *testing.T) {
+	fs := KnownFaults()
+	if len(fs) != len(knownFaults) {
+		t.Fatalf("got %d faults, want %d", len(fs), len(knownFaults))
+	}
+	for i := 1; i < len(fs); i++ {
+		if fs[i-1] >= fs[i] {
+			t.Fatalf("not sorted: %v", fs)
+		}
+	}
+	for _, f := range fs {
+		c := Config{Rules: []Rule{{Name: "r", Fault: f, Probability: 1}}}
+		if err := c.Validate(); err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+	}
+}

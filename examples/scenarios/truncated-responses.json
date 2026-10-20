@@ -1,0 +1,27 @@
+{
+    "seed": 21,
+    "rules": [
+      {
+        "name": "truncated-payment-response",
+        "match": { "method": "POST", "path_prefix": "/v1/payment_intents" },
+        "fault": "truncate_after_commit",
+        "probability": 0.2
+      },
+      {
+        "name": "lost-response-on-payment",
+        "match": { "method": "POST", "path_prefix": "/v1/payment_intents" },
+        "fault": "drop_after_commit",
+        "probability": 0.1
+      },
+      {
+        "name": "slow-network",
+        "fault": "latency",
+        "probability": 0.2,
+        "delay_ms": 300
+      }
+    ],
+    "webhooks": { "duplicate_probability": 0, "duplicate_count": 0, "max_delay_ms": 0, "reorder_window_ms": 0 },
+    "operation_id": ["metadata[order_id]"],
+    "min_backoff_ms": 200
+  }
+  

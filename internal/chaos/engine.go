@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -40,12 +41,27 @@ const (
 	// response for DelayMS before delivering it. A client whose timeout is
 	// shorter gives up on a request that has already committed.
 	FaultHoldResponse Fault = "hold_response"
+	// FaultTruncateAfterCommit forwards the request, lets the upstream commit
+	// it, then sends the status line, headers and only part of the body before
+	// resetting the connection. The client sees a 200 it cannot parse, which
+	// many integrations misread as a failure.
+	FaultTruncateAfterCommit Fault = "truncate_after_commit"
 )
 
 var knownFaults = map[Fault]bool{
 	FaultNone: true, FaultLatency: true, FaultError500: true, FaultRateLimit: true,
 	FaultDropAfterCommit: true, FaultTimeoutBeforeForward: true,
-	FaultError500AfterCommit: true, FaultHoldResponse: true,
+	FaultError500AfterCommit: true, FaultHoldResponse: true, FaultTruncateAfterCommit: true,
+}
+
+// KnownFaults lists every fault name, sorted, for help text and validation.
+func KnownFaults() []Fault {
+	out := make([]Fault, 0, len(knownFaults))
+	for f := range knownFaults {
+		out = append(out, f)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // Match selects which requests a rule applies to. Empty fields match anything.

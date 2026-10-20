@@ -3,6 +3,8 @@
 //	paychaos [flags]          run the fault-injecting proxy (and optional webhook relay)
 //	paychaos mock [-listen]   run the bundled Stripe-shaped mock API
 //	paychaos scenario         print the default scenario as JSON
+//	paychaos validate FILE... check scenario files without running anything
+//	paychaos compare BASE CUR compare two JSON reports; exit 2 on new findings
 package main
 
 import (
@@ -17,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -37,6 +40,10 @@ func main() {
 			b, _ := json.MarshalIndent(chaos.DefaultConfig(), "", "  ")
 			fmt.Println(string(b))
 			return
+		case "validate":
+			os.Exit(runValidate(os.Args[2:]))
+		case "compare":
+			os.Exit(runCompare(os.Args[2:]))
 		}
 	}
 	os.Exit(run(os.Args[1:]))
@@ -51,6 +58,8 @@ func run(args []string) int {
 	whListen := fs.String("webhook-listen", "", "address for the webhook relay, e.g. 127.0.0.1:8081 (disabled if empty)")
 	whTarget := fs.String("webhook-target", "", "your app's webhook endpoint the relay delivers to")
 	reportPath := fs.String("report", "paychaos-report.json", "where to write the JSON report on exit")
+	junitPath := fs.String("junit", "", "also write findings as JUnit XML to this file, for CI test reporters")
+	mdPath := fs.String("markdown", "", "also write a Markdown summary to this file (\"-\" for stdout), e.g. $GITHUB_STEP_SUMMARY")
 	duration := fs.Duration("duration", 0, "stop automatically after this long (0 = until Ctrl-C)")
 	failOnHigh := fs.Bool("fail-on-high", true, "exit with status 2 if any HIGH finding was detected (for CI)")
 	mockDelay := fs.Duration("mock-exec-delay", 0, "with -upstream mock: how long each create executes (retries reusing the key meanwhile get 409)")
@@ -155,6 +164,16 @@ func run(args []string) int {
 	} else {
 		fmt.Printf("\nFull report: %s\n", *reportPath)
 	}
+	if *junitPath != "" {
+		if err := rep.WriteJUnit(*junitPath); err != nil {
+			log.Error("writing JUnit report", "err", err)
+		}
+	}
+	if *mdPath != "" {
+		if err := writeMarkdown(rep, *mdPath); err != nil {
+			log.Error("writing Markdown report", "err", err)
+		}
+	}
 	if *failOnHigh && rep.HasHigh() {
 		return 2
 	}
@@ -173,6 +192,80 @@ func runMock(args []string) int {
 	if err := srv.ListenAndServe(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
+	}
+	return 0
+}
+
+// writeMarkdown appends to path rather than truncating it, because
+// $GITHUB_STEP_SUMMARY is shared by every step of a job.
+func writeMarkdown(rep report.Report, path string) error {
+	if path == "-" {
+		rep.WriteMarkdown(os.Stdout)
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	rep.WriteMarkdown(f)
+	return f.Close()
+}
+
+func runValidate(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: paychaos validate SCENARIO.json...")
+		return 1
+	}
+	bad := 0
+	for _, path := range args {
+		cfg, err := chaos.LoadConfig(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "FAIL %s: %v\n", path, err)
+			bad++
+			continue
+		}
+		fmt.Printf("ok   %s (seed %d, %d rules)\n", path, cfg.Seed, len(cfg.Rules))
+	}
+	if bad > 0 {
+		fmt.Fprintf(os.Stderr, "\nknown faults: %v\n", chaos.KnownFaults())
+		return 1
+	}
+	return 0
+}
+
+func runCompare(args []string) int {
+	fs := flag.NewFlagSet("compare", flag.ExitOnError)
+	failOn := fs.String("fail-on", "high", "exit 2 when a new finding is at least this severe: high, medium or low")
+	asJSON := fs.Bool("json", false, "print the comparison as JSON")
+	_ = fs.Parse(args)
+	if fs.NArg() != 2 {
+		fmt.Fprintln(os.Stderr, "usage: paychaos compare [-fail-on high|medium|low] [-json] BASELINE.json CURRENT.json")
+		return 1
+	}
+	min := audit.Severity(strings.ToUpper(*failOn))
+	if min != audit.High && min != audit.Medium && min != audit.Low {
+		fmt.Fprintf(os.Stderr, "-fail-on must be high, medium or low, not %q\n", *failOn)
+		return 1
+	}
+	base, err := report.Load(fs.Arg(0))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	cur, err := report.Load(fs.Arg(1))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	d := report.Compare(base, cur)
+	if *asJSON {
+		b, _ := json.MarshalIndent(d, "", "  ")
+		fmt.Println(string(b))
+	} else {
+		d.WriteText(os.Stdout)
+	}
+	if d.Regressed(min) {
+		return 2
 	}
 	return 0
 }

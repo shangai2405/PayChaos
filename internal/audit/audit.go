@@ -26,13 +26,14 @@ const (
 
 // Finding codes.
 const (
-	CodeUnsafeRetry      = "UNSAFE_RETRY_AFTER_LOST_RESPONSE"
-	CodeWouldDuplicate   = "UNSAFE_RETRY_FAILED_THIS_TIME"
-	CodeUnreconciled     = "COMMITTED_BUT_REPORTED_AS_FAILED"
-	CodeAmbiguousRetry   = "NEW_KEY_AFTER_INDETERMINATE_ERROR"
-	CodeMissingKey       = "MISSING_IDEMPOTENCY_KEY"
-	CodeKeyReusedNewBody = "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_BODY"
-	CodeNoBackoff        = "RETRY_WITHOUT_BACKOFF"
+	CodeUnsafeRetry       = "UNSAFE_RETRY_AFTER_LOST_RESPONSE"
+	CodeWouldDuplicate    = "UNSAFE_RETRY_FAILED_THIS_TIME"
+	CodeUnreconciled      = "COMMITTED_BUT_REPORTED_AS_FAILED"
+	CodeAmbiguousRetry    = "NEW_KEY_AFTER_INDETERMINATE_ERROR"
+	CodeMissingKey        = "MISSING_IDEMPOTENCY_KEY"
+	CodeKeyReusedNewBody  = "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_BODY"
+	CodeNoBackoff         = "RETRY_WITHOUT_BACKOFF"
+	CodeTruncatedAccepted = "TRUNCATED_SUCCESS_NOT_RETRIED"
 )
 
 // Finding is one problem the auditor detected.
@@ -258,11 +259,11 @@ func (a *Auditor) hasLostOriginal(fp, idemKey string) bool {
 }
 
 // lostResponse reports whether a committed attempt's result never reached the
-// client: the connection was reset, the client was told 500, or the response
-// was held until after the client gave up.
+// client: the connection was reset, the body was cut short, the client was
+// told 500, or the response was held until after the client gave up.
 func lostResponse(r Record) bool {
 	switch r.Fault {
-	case chaos.FaultDropAfterCommit, chaos.FaultError500AfterCommit:
+	case chaos.FaultDropAfterCommit, chaos.FaultError500AfterCommit, chaos.FaultTruncateAfterCommit:
 		return true
 	case chaos.FaultHoldResponse:
 		return !r.ResponseDelivered
@@ -400,6 +401,17 @@ func (a *Auditor) unreconciled() []Finding {
 		idx := a.byFP[r.Fingerprint]
 		if a.records[idx[len(idx)-1]].Seq != r.Seq {
 			continue // something retried it; judged elsewhere
+		}
+		if r.Fault == chaos.FaultTruncateAfterCommit {
+			// The client did get a 2xx status, so it may well have treated
+			// the request as a success. What it cannot have is the body.
+			out = append(out, Finding{
+				Code: CodeTruncatedAccepted, Severity: Low, Path: r.Path, Fingerprint: r.Fingerprint,
+				Requests: []int{r.Seq}, ObjectIDs: nonEmpty(r.ObjectID), At: r.Done,
+				Message: fmt.Sprintf("request #%d was performed upstream%s and answered with status %d, but the body was cut short and the client never retried. If it reads the created object from the response, it has no record of it; if it treats an unreadable body as a failure, it recorded a failure for an operation that succeeded",
+					r.Seq, objSuffix(r.ObjectID), r.UpstreamStatus),
+			})
+			continue
 		}
 		out = append(out, Finding{
 			Code: CodeUnreconciled, Severity: Medium, Path: r.Path, Fingerprint: r.Fingerprint,

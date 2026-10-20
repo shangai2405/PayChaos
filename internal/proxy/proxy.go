@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -139,7 +140,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// For faults that cut the client off or make it give up, the upstream call
 	// must outlive the client; detach it from the client's context.
 	ctx := r.Context()
-	if d.Fault == chaos.FaultDropAfterCommit || d.Fault == chaos.FaultHoldResponse {
+	if d.Fault == chaos.FaultDropAfterCommit || d.Fault == chaos.FaultHoldResponse || d.Fault == chaos.FaultTruncateAfterCommit {
 		ctx = context.WithoutCancel(ctx)
 	}
 	resp, err := p.forward(ctx, r, body)
@@ -168,6 +169,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		complete(resp.StatusCode, committed, objectID)
 		log.Info("upstream committed; resetting client connection", "upstream_status", resp.StatusCode)
 		resetConnection(w)
+		return
+	}
+
+	if d.Fault == chaos.FaultTruncateAfterCommit {
+		complete(resp.StatusCode, committed, objectID)
+		log.Info("upstream committed; truncating the response body", "upstream_status", resp.StatusCode)
+		truncateResponse(w, resp, respBody)
 		return
 	}
 
@@ -246,6 +254,40 @@ func resetConnection(w http.ResponseWriter) {
 		w.WriteHeader(http.StatusBadGateway)
 		return
 	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetLinger(0)
+	}
+	_ = conn.Close()
+}
+
+// truncateResponse sends the upstream's status line and headers, announcing the
+// full Content-Length, then only the first half of the body before resetting
+// the connection. The client has a success status in hand but a body it cannot
+// parse, the way a proxy or load balancer dying mid-transfer looks. Without
+// hijacking it falls back to net/http, which closes the connection when fewer
+// bytes than Content-Length are written.
+func truncateResponse(w http.ResponseWriter, resp *http.Response, body []byte) {
+	partial := body[:len(body)/2]
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		copyHeaders(w.Header(), resp.Header)
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(partial)
+		return
+	}
+	conn, buf, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	h := http.Header{}
+	copyHeaders(h, resp.Header)
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	fmt.Fprintf(buf, "HTTP/1.1 %d %s\r\n", resp.StatusCode, http.StatusText(resp.StatusCode))
+	_ = h.Write(buf)
+	_, _ = buf.WriteString("\r\n")
+	_, _ = buf.Write(partial)
+	_ = buf.Flush()
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetLinger(0)
 	}
